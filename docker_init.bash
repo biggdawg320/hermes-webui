@@ -236,10 +236,35 @@ chown_home_hermeswebui() {
   # source — prune the entire hermes-agent path from the chown walk so a
   # read-only or partially-read-only mount doesn't break the rest of the home
   # ownership alignment.
+  if find /home/hermeswebui \
+    -path "/home/hermeswebui/.hermes/hermes-agent" -prune \
+    -o -name ".git" -prune \
+    -o -exec chown -h "${WANTED_UID}:${WANTED_GID}" {} +; then
+    return 0
+  fi
+  # A name `find` read via readdir() above can vanish before the batched
+  # `chown` call reaches it, if something else is concurrently writing into
+  # the same tree — for example the agent's `os.replace`-style atomic rename
+  # of gateway-starts.log into the shared ~/.hermes on first start (#8106).
+  # `chown` then reports that one name as missing and `find` fails the whole
+  # walk. Re-walk once more, still chowning each batch in a single `chown`
+  # call (forking one per file would be far too slow over a large home
+  # directory), but this time only swallow the batch's failure if every
+  # error line chown printed was a vanished name — any other failure
+  # (EACCES, EROFS, ...) still aborts.
   find /home/hermeswebui \
     -path "/home/hermeswebui/.hermes/hermes-agent" -prune \
     -o -name ".git" -prune \
-    -o -exec chown -h "${WANTED_UID}:${WANTED_GID}" {} +
+    -o -exec sh -c '
+      owner=$1; shift
+      err=$(chown -h "$owner" "$@" 2>&1 1>/dev/null)
+      rc=$?
+      [ "$rc" -eq 0 ] && exit 0
+      [ -z "$err" ] && exit "$rc"
+      remaining=$(printf "%s\n" "$err" | grep -v "No such file or directory")
+      [ -z "$remaining" ] && exit 0
+      exit "$rc"
+    ' sh "${WANTED_UID}:${WANTED_GID}" {} +
 }
 
 # The production image does not ship sudo. The entrypoint starts as root only
@@ -267,6 +292,13 @@ if [ "A${whoami}" == "Aroot" ]; then
     fi
   else
     groupmod -o -g "${WANTED_GID}" hermeswebui || error_exit "Failed to set GID of hermeswebui user"
+    # usermod -u walks the home directory and chowns everything owned by the
+    # old UID, but only when the home directory itself is still owned by the
+    # old or new UID. Making it root-owned first skips that implicit walk —
+    # chown_home_hermeswebui below realigns ownership (including this
+    # directory) right after, and tolerates a file vanishing mid-walk, which
+    # usermod's own walk does not (#8106).
+    chown root:root /home/hermeswebui 2>/dev/null || true
     usermod -o -u "${WANTED_UID}" hermeswebui || error_exit "Failed to set UID of hermeswebui user"
   fi
 
